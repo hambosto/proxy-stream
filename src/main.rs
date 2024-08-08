@@ -4,6 +4,7 @@ use std::error::Error;
 use clap::Parser;
 use std::sync::Arc;
 use tokio::time::{timeout, Duration};
+use std::net::SocketAddr;
 
 /// Command line arguments for the TCP proxy
 #[derive(Parser, Debug)]
@@ -32,25 +33,36 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Parse command line arguments
     let args = Arc::new(Args::parse());
 
-    // Construct the address to bind the listener
+    // Start the TCP proxy server
+    start_proxy(args).await?;
+
+    Ok(())
+}
+
+/// Starts the TCP proxy server
+///
+/// # Arguments
+///
+/// * `args` - Reference to the command line arguments
+///
+/// # Returns
+///
+/// A Result indicating success or containing an error
+async fn start_proxy(args: Arc<Args>) -> Result<(), Box<dyn Error>> {
     let addr = format!("0.0.0.0:{}", args.listen_port);
     let listener = TcpListener::bind(&addr).await?;
-    
-    println!("[INFO] - Server started on port: {}", args.listen_port);
-    println!("[INFO] - Redirecting requests to: {} at port {}", args.destination_host, args.destination_port);
 
-    // Main server loop
+    println!("[INFO] - Server started on port: {}", args.listen_port);
+    println!(
+        "[INFO] - Redirecting requests to: {} at port {}",
+        args.destination_host, args.destination_port
+    );
+
     loop {
-        // Wait for a client to connect
-        let (inbound, _) = listener.accept().await?;
+        let (inbound, peer_addr) = listener.accept().await?;
+
         let args = Arc::clone(&args);
-        
-        // Spawn a new task to handle the connection
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(inbound, &args).await {
-                eprintln!("[ERROR] - {}", e);
-            }
-        });
+        tokio::spawn(handle_client(inbound, args, peer_addr));
     }
 }
 
@@ -60,39 +72,78 @@ async fn main() -> Result<(), Box<dyn Error>> {
 ///
 /// * `inbound` - The incoming TCP stream from the client
 /// * `args` - Reference to the command line arguments
+/// * `peer_addr` - The address of the client
 ///
 /// # Returns
 ///
 /// A Result indicating success or containing an error
-async fn handle_connection(mut inbound: TcpStream, args: &Args) -> Result<(), Box<dyn Error + Send + Sync>> {
-    // Get the peer address for logging
-    let peer_addr = inbound.peer_addr()?;
+async fn handle_client(
+    mut inbound: TcpStream,
+    args: Arc<Args>,
+    peer_addr: SocketAddr,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     println!("[INFO] - Connection received from {}", peer_addr);
 
-    // Send initial response to the client
-    inbound.write_all(b"HTTP/1.1 101 Switching Protocols\r\nContent-Length: 1048576000000\r\n\r\n").await?;
+    if let Err(e) = send_initial_response(&mut inbound).await {
+        eprintln!("[ERROR] - Failed to send initial response to {}: {}", peer_addr, e);
+        return Err(e);
+    }
 
-    // Connect to the destination server
+    match handle_connection(&mut inbound, &args).await {
+        Ok(_) => println!("[INFO] - Connection terminated for {}", peer_addr),
+        Err(e) => eprintln!("[ERROR] - Connection handling error for {}: {}", peer_addr, e),
+    }
+
+    Ok(())
+}
+
+/// Sends an initial response to the client
+///
+/// # Arguments
+///
+/// * `inbound` - The incoming TCP stream from the client
+///
+/// # Returns
+///
+/// A Result indicating success or containing an error
+async fn send_initial_response(inbound: &mut TcpStream) -> Result<(), Box<dyn Error + Send + Sync>> {
+    inbound
+        .write_all(b"HTTP/1.1 101 Switching Protocols\r\nContent-Length: 1048576000000\r\n\r\n")
+        .await?;
+    Ok(())
+}
+
+/// Handles bidirectional data transfer between client and server
+///
+/// # Arguments
+///
+/// * `inbound` - The incoming TCP stream from the client
+/// * `args` - Reference to the command line arguments
+///
+/// # Returns
+///
+/// A Result indicating success or containing an error
+async fn handle_connection(
+    inbound: &mut TcpStream,
+    args: &Args,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let peer_addr = inbound.peer_addr()?;
     let mut outbound = TcpStream::connect(format!("{}:{}", args.destination_host, args.destination_port)).await?;
 
-    // Set up the timeout duration
     let timeout_duration = Duration::from_secs(args.timeout_seconds);
 
-    // Use copy_bidirectional with a timeout to handle data transfer
-    let (bytes_copied_to_server, bytes_copied_to_client) = match timeout(
-        timeout_duration,
-        copy_bidirectional(&mut inbound, &mut outbound)
-    ).await {
-        Ok(result) => result?,
+    let (bytes_to_server, bytes_to_client) = match timeout(timeout_duration, copy_bidirectional(inbound, &mut outbound)).await {
+        Ok(transfer) => transfer?,
         Err(_) => {
             println!("[INFO] - Connection timed out for {}", peer_addr);
             return Ok(());
         }
     };
 
-    // Log connection termination and bytes transferred
-    println!("[INFO] - Connection terminated for {}. Bytes to server: {}, Bytes to client: {}", 
-             peer_addr, bytes_copied_to_server, bytes_copied_to_client);
+    println!(
+        "[INFO] - Connection closed for {}. Bytes to server: {}, Bytes to client: {}",
+        peer_addr, bytes_to_server, bytes_to_client
+    );
 
     Ok(())
 }
