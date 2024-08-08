@@ -1,165 +1,84 @@
 use tokio::net::{TcpListener, TcpStream};
-use tokio::io::{AsyncWriteExt, copy_bidirectional};
+use tokio::io::AsyncWriteExt;
 use std::error::Error;
 use clap::Parser;
-use std::sync::Arc;
-use tokio::time::{timeout, Duration};
-use tokio::sync::Semaphore;
-use tracing::{info, error};
-use std::net::SocketAddr;
 
-/// Command line arguments for the TCP proxy
+/// Command-line arguments for the proxy server.
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Port number on which the proxy will listen
-    #[arg(long, default_value_t = 8000)]
+    /// Port on which the proxy server listens.
+    #[arg(long, default_value_t = 8888)]
     listen_port: u16,
 
-    /// Destination port to which traffic will be forwarded
+    /// Port to which the incoming connections are redirected.
     #[arg(long, default_value_t = 110)]
     destination_port: u16,
 
-    /// Destination host to which traffic will be forwarded
+    /// Host to which the incoming connections are redirected.
     #[arg(long, default_value = "127.0.0.1")]
     destination_host: String,
-
-    /// Timeout in seconds for idle connections
-    #[arg(long, default_value_t = 30)]
-    timeout_seconds: u64,
-
-    /// Maximum number of concurrent connections
-    #[arg(long, default_value_t = 1000)]
-    max_connections: usize,
 }
 
-/// Main function to run the TCP proxy
+/// Entry point of the application.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    // Initialize logging
-    tracing_subscriber::fmt::init();
+    let args = Args::parse();
 
-    // Parse command line arguments
-    let args = Arc::new(Args::parse());
-
-    // Start the TCP proxy server
-    start_proxy(args).await?;
-
-    Ok(())
-}
-
-/// Starts the TCP proxy server
-///
-/// # Arguments
-///
-/// * `args` - Reference to the command line arguments
-///
-/// # Returns
-///
-/// A Result indicating success or containing an error
-async fn start_proxy(args: Arc<Args>) -> Result<(), Box<dyn Error>> {
+    // Format the address to bind the listener to.
     let addr = format!("0.0.0.0:{}", args.listen_port);
     let listener = TcpListener::bind(&addr).await?;
-    let semaphore = Arc::new(Semaphore::new(args.max_connections));
+    println!("[INFO] - Server started on port: {}", args.listen_port);
+    println!("[INFO] - Redirecting requests to: {} at port {}", args.destination_host, args.destination_port);
 
-    info!("Server started on port: {}", args.listen_port);
-    info!(
-        "Redirecting requests to: {} at port {}",
-        args.destination_host, args.destination_port
-    );
-
-    loop {
-        let (inbound, peer_addr) = listener.accept().await?;
-        let args = Arc::clone(&args);
-        let permit = Arc::clone(&semaphore).acquire_owned().await?;
-
+    // Accept incoming connections in a loop.
+    while let Ok((inbound, _)) = listener.accept().await {
+        let destination_host = args.destination_host.clone();
+        let destination_port = args.destination_port;
+        
+        // Spawn a new task to handle each connection.
         tokio::spawn(async move {
-            if let Err(e) = handle_client(inbound, args, peer_addr).await {
-                error!("Connection handling error for {}: {}", peer_addr, e);
+            if let Err(e) = handle_connection(inbound, &destination_host, destination_port).await {
+                eprintln!("[ERROR] - {}", e);
             }
-            drop(permit); // Release the semaphore permit when done
         });
     }
-}
-
-/// Handles an individual client connection
-///
-/// # Arguments
-///
-/// * `inbound` - The incoming TCP stream from the client
-/// * `args` - Reference to the command line arguments
-/// * `peer_addr` - The address of the client
-///
-/// # Returns
-///
-/// A Result indicating success or containing an error
-async fn handle_client(
-    mut inbound: TcpStream,
-    args: Arc<Args>,
-    peer_addr: SocketAddr,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    info!("Connection received from {}", peer_addr);
-
-    if let Err(e) = send_initial_response(&mut inbound).await {
-        error!("Failed to send initial response to {}: {}", peer_addr, e);
-        return Err(e);
-    }
-
-    match handle_connection(&mut inbound, &args).await {
-        Ok(_) => info!("Connection terminated for {}", peer_addr),
-        Err(e) => error!("Connection handling error for {}: {}", peer_addr, e),
-    }
 
     Ok(())
 }
 
-/// Sends an initial response to the client
-///
-/// # Arguments
-///
-/// * `inbound` - The incoming TCP stream from the client
-///
-/// # Returns
-///
-/// A Result indicating success or containing an error
-async fn send_initial_response(inbound: &mut TcpStream) -> Result<(), Box<dyn Error + Send + Sync>> {
-    inbound
-        .write_all(b"HTTP/1.1 101 Switching Protocols\r\nContent-Length: 1048576000000\r\n\r\n")
-        .await?;
-    Ok(())
-}
-
-/// Handles bidirectional data transfer between client and server
-///
-/// # Arguments
-///
-/// * `inbound` - The incoming TCP stream from the client
-/// * `args` - Reference to the command line arguments
-///
-/// # Returns
-///
-/// A Result indicating success or containing an error
-async fn handle_connection(
-    inbound: &mut TcpStream,
-    args: &Args,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+/// Handles a single TCP connection, forwarding data between the client and destination server.
+async fn handle_connection(mut inbound: TcpStream, destination_host: &str, destination_port: u16) -> Result<(), Box<dyn Error + Send + Sync>> {
+    // Log the address of the client that connected.
     let peer_addr = inbound.peer_addr()?;
-    let mut outbound = TcpStream::connect(format!("{}:{}", args.destination_host, args.destination_port)).await?;
+    println!("[INFO] - Connection received from {}", peer_addr);
 
-    let timeout_duration = Duration::from_secs(args.timeout_seconds);
+    // Send an HTTP response to initiate protocol switching.
+    inbound.write_all(b"HTTP/1.1 101 Switching Protocols\r\nContent-Length: 1048576000000\r\n\r\n").await?;
 
-    let (bytes_to_server, bytes_to_client) = match timeout(timeout_duration, copy_bidirectional(inbound, &mut outbound)).await {
-        Ok(transfer) => transfer?,
-        Err(_) => {
-            info!("Connection timed out for {}", peer_addr);
-            return Ok(());
-        }
+    // Connect to the destination server.
+    let mut outbound = TcpStream::connect(format!("{}:{}", destination_host, destination_port)).await?;
+
+    // Split the inbound and outbound streams into readers and writers.
+    let (mut ri, mut wi) = inbound.split();
+    let (mut ro, mut wo) = outbound.split();
+
+    // Create tasks to copy data between the client and server.
+    let client_to_server = async {
+        tokio::io::copy(&mut ri, &mut wo).await?;
+        wo.shutdown().await
     };
 
-    info!(
-        "Connection closed for {}. Bytes to server: {}, Bytes to client: {}",
-        peer_addr, bytes_to_server, bytes_to_client
-    );
+    let server_to_client = async {
+        tokio::io::copy(&mut ro, &mut wi).await?;
+        wi.shutdown().await
+    };
+
+    // Run both tasks concurrently and wait for them to complete.
+    tokio::try_join!(client_to_server, server_to_client)?;
+
+    // Log when the connection is terminated.
+    println!("[INFO] - Connection terminated for {}", peer_addr);
 
     Ok(())
 }
