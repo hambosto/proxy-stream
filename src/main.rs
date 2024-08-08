@@ -4,6 +4,8 @@ use std::error::Error;
 use clap::Parser;
 use std::sync::Arc;
 use tokio::time::{timeout, Duration};
+use tokio::sync::Semaphore;
+use tracing::{info, error};
 use std::net::SocketAddr;
 
 /// Command line arguments for the TCP proxy
@@ -11,7 +13,7 @@ use std::net::SocketAddr;
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Port number on which the proxy will listen
-    #[arg(long, default_value_t = 8888)]
+    #[arg(long, default_value_t = 8000)]
     listen_port: u16,
 
     /// Destination port to which traffic will be forwarded
@@ -25,11 +27,18 @@ struct Args {
     /// Timeout in seconds for idle connections
     #[arg(long, default_value_t = 30)]
     timeout_seconds: u64,
+
+    /// Maximum number of concurrent connections
+    #[arg(long, default_value_t = 1000)]
+    max_connections: usize,
 }
 
 /// Main function to run the TCP proxy
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    // Initialize logging
+    tracing_subscriber::fmt::init();
+
     // Parse command line arguments
     let args = Arc::new(Args::parse());
 
@@ -51,18 +60,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
 async fn start_proxy(args: Arc<Args>) -> Result<(), Box<dyn Error>> {
     let addr = format!("0.0.0.0:{}", args.listen_port);
     let listener = TcpListener::bind(&addr).await?;
+    let semaphore = Arc::new(Semaphore::new(args.max_connections));
 
-    println!("[INFO] - Server started on port: {}", args.listen_port);
-    println!(
-        "[INFO] - Redirecting requests to: {} at port {}",
+    info!("Server started on port: {}", args.listen_port);
+    info!(
+        "Redirecting requests to: {} at port {}",
         args.destination_host, args.destination_port
     );
 
     loop {
         let (inbound, peer_addr) = listener.accept().await?;
-
         let args = Arc::clone(&args);
-        tokio::spawn(handle_client(inbound, args, peer_addr));
+        let permit = Arc::clone(&semaphore).acquire_owned().await?;
+
+        tokio::spawn(async move {
+            if let Err(e) = handle_client(inbound, args, peer_addr).await {
+                error!("Connection handling error for {}: {}", peer_addr, e);
+            }
+            drop(permit); // Release the semaphore permit when done
+        });
     }
 }
 
@@ -82,16 +98,16 @@ async fn handle_client(
     args: Arc<Args>,
     peer_addr: SocketAddr,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    println!("[INFO] - Connection received from {}", peer_addr);
+    info!("Connection received from {}", peer_addr);
 
     if let Err(e) = send_initial_response(&mut inbound).await {
-        eprintln!("[ERROR] - Failed to send initial response to {}: {}", peer_addr, e);
+        error!("Failed to send initial response to {}: {}", peer_addr, e);
         return Err(e);
     }
 
     match handle_connection(&mut inbound, &args).await {
-        Ok(_) => println!("[INFO] - Connection terminated for {}", peer_addr),
-        Err(e) => eprintln!("[ERROR] - Connection handling error for {}: {}", peer_addr, e),
+        Ok(_) => info!("Connection terminated for {}", peer_addr),
+        Err(e) => error!("Connection handling error for {}: {}", peer_addr, e),
     }
 
     Ok(())
@@ -135,13 +151,13 @@ async fn handle_connection(
     let (bytes_to_server, bytes_to_client) = match timeout(timeout_duration, copy_bidirectional(inbound, &mut outbound)).await {
         Ok(transfer) => transfer?,
         Err(_) => {
-            println!("[INFO] - Connection timed out for {}", peer_addr);
+            info!("Connection timed out for {}", peer_addr);
             return Ok(());
         }
     };
 
-    println!(
-        "[INFO] - Connection closed for {}. Bytes to server: {}, Bytes to client: {}",
+    info!(
+        "Connection closed for {}. Bytes to server: {}, Bytes to client: {}",
         peer_addr, bytes_to_server, bytes_to_client
     );
 
