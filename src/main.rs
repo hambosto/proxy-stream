@@ -1,84 +1,114 @@
-use tokio::net::{TcpListener, TcpStream};
-use tokio::io::AsyncWriteExt;
-use std::error::Error;
-use clap::Parser;
+use std::env;
+use std::net::{TcpListener, TcpStream};
+use std::io::{Read, Write};
+use std::thread;
 
-/// Command-line arguments for the proxy server.
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    /// Port on which the proxy server listens.
-    #[arg(long, default_value_t = 8888)]
-    listen_port: u16,
+fn main() -> std::io::Result<()> {
+    let args: Vec<String> = env::args().collect();
+    let mut target_host = String::from("127.0.0.1");
+    let mut target_port = String::from("109");
+    let mut listen_port = String::from("30001");
+    let mut packets_to_skip = 0;
 
-    /// Port to which the incoming connections are redirected.
-    #[arg(long, default_value_t = 110)]
-    destination_port: u16,
+    // Parse command line arguments
+    for i in 0..args.len() {
+        match args[i].as_str() {
+            "-skip" => packets_to_skip = args[i + 1].parse().unwrap_or(0),
+            "--target-host" => target_host = args[i + 1].clone(),
+            "--target-port" => target_port = args[i + 1].clone(),
+            "--listen-port" => listen_port = args[i + 1].clone(),
+            _ => {}
+        }
+    }
 
-    /// Host to which the incoming connections are redirected.
-    #[arg(long, default_value = "127.0.0.1")]
-    destination_host: String,
-}
+    println!("[INFO] - Server started on port: {}", listen_port);
+    println!("[INFO] - Redirecting requests to: {} at port {}", target_host, target_port);
 
-/// Entry point of the application.
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let args = Args::parse();
+    let listener = TcpListener::bind(format!("0.0.0.0:{}", listen_port))?;
 
-    // Format the address to bind the listener to.
-    let addr = format!("0.0.0.0:{}", args.listen_port);
-    let listener = TcpListener::bind(&addr).await?;
-    println!("[INFO] - Server started on port: {}", args.listen_port);
-    println!("[INFO] - Redirecting requests to: {} at port {}", args.destination_host, args.destination_port);
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                let target_host = target_host.clone();
+                let target_port = target_port.clone();
+                let packets_to_skip = packets_to_skip;
 
-    // Accept incoming connections in a loop.
-    while let Ok((inbound, _)) = listener.accept().await {
-        let destination_host = args.destination_host.clone();
-        let destination_port = args.destination_port;
-        
-        // Spawn a new task to handle each connection.
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(inbound, &destination_host, destination_port).await {
-                eprintln!("[ERROR] - {}", e);
+                thread::spawn(move || {
+                    handle_client(stream, &target_host, &target_port, packets_to_skip).unwrap_or_else(|error| {
+                        eprintln!("[ERROR] - Failed to handle client: {}", error);
+                    });
+                });
             }
-        });
+            Err(e) => {
+                eprintln!("[ERROR] - Failed to accept connection: {}", e);
+            }
+        }
     }
 
     Ok(())
 }
 
-/// Handles a single TCP connection, forwarding data between the client and destination server.
-async fn handle_connection(mut inbound: TcpStream, destination_host: &str, destination_port: u16) -> Result<(), Box<dyn Error + Send + Sync>> {
-    // Log the address of the client that connected.
-    let peer_addr = inbound.peer_addr()?;
-    println!("[INFO] - Connection received from {}", peer_addr);
+fn handle_client(mut client: TcpStream, target_host: &str, target_port: &str, packets_to_skip: usize) -> std::io::Result<()> {
+    let client_addr = client.peer_addr()?;
+    println!("[INFO] - Connection received from {}:{}", client_addr.ip(), client_addr.port());
 
-    // Send an HTTP response to initiate protocol switching.
-    inbound.write_all(b"HTTP/1.1 101 Switching Protocols\r\nContent-Length: 1048576000000\r\n\r\n").await?;
+    client.write_all(b"HTTP/1.1 101 Switching Protocols\r\nContent-Length: 1048576000000\r\n\r\n")?;
 
-    // Connect to the destination server.
-    let mut outbound = TcpStream::connect(format!("{}:{}", destination_host, destination_port)).await?;
+    let mut server = TcpStream::connect(format!("{}:{}", target_host, target_port))?;
 
-    // Split the inbound and outbound streams into readers and writers.
-    let (mut ri, mut wi) = inbound.split();
-    let (mut ro, mut wo) = outbound.split();
+    let mut packet_count = 0;
+    let mut client_clone = client.try_clone()?;
+    let mut server_clone = server.try_clone()?;
 
-    // Create tasks to copy data between the client and server.
-    let client_to_server = async {
-        tokio::io::copy(&mut ri, &mut wo).await?;
-        wo.shutdown().await
-    };
+    let client_to_server = thread::spawn(move || {
+        let mut buffer = [0; 4096];
+        loop {
+            match client_clone.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if packet_count < packets_to_skip {
+                        packet_count += 1;
+                    } else if packet_count == packets_to_skip {
+                        if let Err(e) = server_clone.write_all(&buffer[..n]) {
+                            eprintln!("[ERROR] - Failed to write to server: {}", e);
+                            break;
+                        }
+                    }
+                    if packet_count > packets_to_skip {
+                        packet_count = packets_to_skip;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[ERROR] - Failed to read from client: {}", e);
+                    break;
+                }
+            }
+        }
+    });
 
-    let server_to_client = async {
-        tokio::io::copy(&mut ro, &mut wi).await?;
-        wi.shutdown().await
-    };
+    let server_to_client = thread::spawn(move || {
+        let mut buffer = [0; 4096];
+        loop {
+            match server.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if let Err(e) = client.write_all(&buffer[..n]) {
+                        eprintln!("[ERROR] - Failed to write to client: {}", e);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[ERROR] - Failed to read from server: {}", e);
+                    break;
+                }
+            }
+        }
+    });
 
-    // Run both tasks concurrently and wait for them to complete.
-    tokio::try_join!(client_to_server, server_to_client)?;
+    client_to_server.join().unwrap();
+    server_to_client.join().unwrap();
 
-    // Log when the connection is terminated.
-    println!("[INFO] - Connection terminated for {}", peer_addr);
+    println!("[INFO] - Connection terminated for {}:{}", client_addr.ip(), client_addr.port());
 
     Ok(())
 }
